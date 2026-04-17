@@ -1,0 +1,66 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* Zinc dark theme — forced dark mode */
+  :root {
+    --background:   240 10% 3.9%;
+    --foreground:   0 0% 98%;
+    --card:         240 10% 5.5%;
+    --card-foreground: 0 0% 98%;
+    --popover:      240 10% 6%;
+    --popover-foreground: 0 0% 98%;
+    --primary:      0 0% 98%;
+    --primary-foreground: 240 5.9% 10%;
+    --secondary:    240 3.7% 15.9%;
+    --secondary-foreground: 0 0% 98%;
+    --muted:        240 3.7% 13%;
+    --muted-foreground: 240 5% 64.9%;
+    --accent:       240 3.7% 15.9%;
+    --accent-foreground: 0 0% 98%;
+    --destructive:  0 62.8% 30.6%;
+    --destructive-foreground: 0 0% 98%;
+    --border:       240 3.7% 15.9%;
+    --input:        240 3.7% 15.9%;
+    --ring:         240 4.9% 83.9%;
+    --radius:       0.5rem;
+
+    /* Sidebar — slightly darker than the page */
+    --sidebar:                  240 6% 7%;
+    --sidebar-foreground:       240 5% 84.9%;
+    --sidebar-border:           240 3.7% 12%;
+    --sidebar-accent:           240 3.7% 13%;
+    --sidebar-accent-foreground: 0 0% 98%;
+    --sidebar-muted:            240 5% 50%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+
+  /* Scrollbar styling */
+  ::-webkit-scrollbar        { @apply w-1.5 h-1.5; }
+  ::-webkit-scrollbar-track  { @apply bg-transparent; }
+  ::-webkit-scrollbar-thumb  { @apply rounded-full bg-zinc-700; }
+  ::-webkit-scrollbar-thumb:hover { @apply bg-zinc-600; }
+}
+
+@layer utilities {
+  .sidebar-nav-item {
+    @apply flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium
+           text-sidebar-foreground/70 transition-colors
+           hover:bg-sidebar-accent hover:text-sidebar-accent-foreground;
+  }
+  .sidebar-nav-item.active {
+    @apply bg-sidebar-accent text-sidebar-accent-foreground;
+  }
+  .card-stat {
+    @apply rounded-xl border border-border/50 bg-card p-5;
+  }
+}

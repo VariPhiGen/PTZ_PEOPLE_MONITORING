@@ -1,0 +1,17 @@
+# Override: CPU-fallback mode — used when no NVIDIA GPU / driver is available.
+# The GPU Dockerfile is still used; onnxruntime-gpu and faiss-gpu-cu12 both
+# gracefully fall back to CPU when libcuda.so.1 / cuInit() is unavailable.
+# Delete this file (or set NVIDIA_VISIBLE_DEVICES=all) when GPU is available.
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.gpu
+    runtime: runc
+    environment:
+      # Tell NVIDIA container toolkit (if present) not to expose any GPU
+      NVIDIA_VISIBLE_DEVICES: "void"
+      # Clear the GPU-specific library path — not needed without CUDA driver
+      LD_LIBRARY_PATH: ""
+      # ORT and FAISS will detect no CUDA driver at runtime and use CPU EP
+      GPU_DEVICE_ID: "0"

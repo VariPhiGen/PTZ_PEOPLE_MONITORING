@@ -1,0 +1,224 @@
+groups:
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # CRITICAL — page immediately
+  # ═══════════════════════════════════════════════════════════════════════════
+  - name: acas-critical
+    rules:
+
+      # ── GPU saturation ────────────────────────────────────────────────────
+      - alert: GPUSaturation
+        expr: acas_gpu_util_percent > 95
+        for: 2m
+        labels:
+          severity: critical
+          component: gpu
+        annotations:
+          summary: "GPU {{ $labels.device_id }} utilisation {{ $value | printf \"%.0f\" }}% for >2 min"
+          description: >
+            GPU utilisation has exceeded 95% for 2 consecutive minutes.
+            The inference pipeline may be queuing frames and recognition accuracy
+            will degrade.  Consider scaling to a second node or reducing active
+            sessions on this node.
+          runbook: "RUNBOOK.md#gpu-oom--saturation"
+
+      # ── GPU OOM degradation mode ──────────────────────────────────────────
+      - alert: GPUDegradationActive
+        expr: acas_gpu_degradation_mode > 1
+        for: 0m
+        labels:
+          severity: critical
+          component: gpu
+        annotations:
+          summary: "GPU degradation mode {{ $value }} — liveness/embedding disabled"
+          description: >
+            VRAM pressure has triggered EMBED_ONLY or YOLO_ONLY degradation mode.
+            Attendance accuracy is severely compromised.
+          runbook: "RUNBOOK.md#gpu-oom--saturation"
+
+      # ── Pipeline latency ─────────────────────────────────────────────────
+      - alert: PipelineLatencyHigh
+        expr: >
+          histogram_quantile(0.95,
+            rate(acas_pipeline_latency_seconds_bucket{stage="total"}[1m])
+          ) > 0.200
+        for: 1m
+        labels:
+          severity: critical
+          component: ai-pipeline
+        annotations:
+          summary: "P95 pipeline latency {{ $value | humanizeDuration }} > 200 ms"
+          description: >
+            The AI pipeline p95 latency has exceeded 200 ms for 1 minute.
+            Real-time attendance tracking may be affected.
+          runbook: "RUNBOOK.md#pipeline-slow"
+
+      # ── Camera offline ────────────────────────────────────────────────────
+      - alert: CameraOffline
+        expr: acas_camera_status == 0
+        for: 5m
+        labels:
+          severity: critical
+          component: camera
+        annotations:
+          summary: "Camera {{ $labels.room_name }} ({{ $labels.camera_id }}) OFFLINE for >5 min"
+          description: >
+            The RTSP stream from {{ $labels.room_name }} has not delivered a
+            frame in over 5 minutes.  PTZ scanning is suspended.
+          runbook: "RUNBOOK.md#camera-offline"
+
+      # ── Kafka consumer lag ────────────────────────────────────────────────
+      - alert: KafkaConsumerLagHigh
+        expr: acas_kafka_consumer_lag > 1000
+        for: 1m
+        labels:
+          severity: critical
+          component: kafka
+        annotations:
+          summary: "Kafka lag {{ $value }} on topic {{ $labels.topic }} group {{ $labels.group }}"
+          description: >
+            Consumer group {{ $labels.group }} is more than 1000 messages behind
+            on {{ $labels.topic }}.  ERP sync or admin-override processing may
+            be delayed.
+          runbook: "RUNBOOK.md#kafka-consumer-lag"
+
+      # ── Kafka produce errors ──────────────────────────────────────────────
+      - alert: KafkaProduceErrors
+        expr: >
+          rate(acas_kafka_produce_total{status="error"}[5m]) /
+          rate(acas_kafka_produce_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+          component: kafka
+        annotations:
+          summary: "Kafka produce error rate {{ $value | humanizePercentage }}"
+          description: >
+            More than 5% of Kafka produce calls are failing.
+            Attendance events and ERP sync may be silently lost.
+          runbook: "RUNBOOK.md#kafka-restart"
+
+      # ── DB pool exhaustion ────────────────────────────────────────────────
+      - alert: DBPoolExhausted
+        expr: acas_db_pool_checkedout >= 28   # out of pool_size=20 + overflow=10
+        for: 1m
+        labels:
+          severity: critical
+          component: database
+        annotations:
+          summary: "DB connection pool at {{ $value }}/30 — near exhaustion"
+          description: >
+            The SQLAlchemy connection pool is almost full.  API requests will
+            begin timing out.  Check for slow queries or connection leaks.
+          runbook: "RUNBOOK.md#db-slow-queries"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # WARNING — alert business hours
+  # ═══════════════════════════════════════════════════════════════════════════
+  - name: acas-warning
+    rules:
+
+      # ── Recognition accuracy degraded ─────────────────────────────────────
+      - alert: RecognitionAccuracyLow
+        expr: >
+          sum(rate(acas_faces_recognized_total{outcome="KNOWN"}[1h]))
+          /
+          sum(rate(acas_faces_recognized_total[1h])) < 0.90
+        for: 1h
+        labels:
+          severity: warning
+          component: ai-pipeline
+        annotations:
+          summary: "Recognition rate {{ $value | humanizePercentage }} < 90% over last hour"
+          description: >
+            The fraction of faces matched to known persons has dropped below 90%.
+            Possible causes: model drift, lighting change, enrollment quality
+            degradation, or FAISS index staleness.
+          runbook: "RUNBOOK.md#low-recognition-accuracy"
+
+      # ── FAISS index size mismatch ─────────────────────────────────────────
+      - alert: FAISSIndexStale
+        expr: acas_faiss_index_size < 1
+        for: 5m
+        labels:
+          severity: warning
+          component: face-repo
+        annotations:
+          summary: "FAISS index for client {{ $labels.client_id }} empty"
+          description: >
+            The FAISS index for client {{ $labels.client_id }} has zero vectors.
+            Face identification will always return UNKNOWN until the index is
+            rebuilt.  Trigger a full_resync via the API.
+          runbook: "RUNBOOK.md#faiss-rebuild"
+
+      # ── MinIO storage pressure ────────────────────────────────────────────
+      - alert: MinIOStorageHigh
+        expr: >
+          (minio_cluster_usage_total_bytes /
+           minio_cluster_capacity_raw_total_bytes) * 100 > 80
+        for: 15m
+        labels:
+          severity: warning
+          component: minio
+        annotations:
+          summary: "MinIO storage at {{ $value | printf \"%.0f\" }}% capacity"
+          description: >
+            Object storage is above 80%.  Face evidence and snapshots will
+            continue accumulating.  Consider increasing disk, enabling
+            lifecycle expiry, or archiving old buckets.
+          runbook: "RUNBOOK.md#minio-storage-full"
+
+      # ── Camera degraded (not fully offline) ──────────────────────────────
+      - alert: CameraDegraded
+        expr: acas_camera_status == 0.5
+        for: 10m
+        labels:
+          severity: warning
+          component: camera
+        annotations:
+          summary: "Camera {{ $labels.room_name }} DEGRADED for >10 min"
+          description: >
+            The camera is reachable via ONVIF but RTSP frames are dropping.
+            Recognition accuracy is reduced.  Check network and encoder load.
+
+      # ── Liveness fail rate ────────────────────────────────────────────────
+      - alert: LivenessFailRateHigh
+        expr: >
+          rate(acas_faces_recognized_total{outcome="LIVENESS_FAIL"}[30m]) /
+          rate(acas_faces_recognized_total[30m]) > 0.15
+        for: 30m
+        labels:
+          severity: warning
+          component: ai-pipeline
+        annotations:
+          summary: "Liveness fail rate {{ $value | humanizePercentage }} > 15% over 30 min"
+          description: >
+            More than 15% of faces are failing the liveness check.
+            Camera positioning, lighting, or MiniFASNet model may need attention.
+
+      # ── GPU thermal warning ───────────────────────────────────────────────
+      - alert: GPUWarmingUp
+        expr: acas_gpu_util_percent > 80
+        for: 10m
+        labels:
+          severity: warning
+          component: gpu
+        annotations:
+          summary: "GPU {{ $labels.device_id }} running at {{ $value | printf \"%.0f\" }}% for 10 min"
+          description: >
+            Sustained high GPU load.  Monitor for thermal throttling.
+            Consider reducing max_concurrent sessions if p95 latency rises.
+
+      # ── Redis memory pressure ─────────────────────────────────────────────
+      - alert: RedisMemoryHigh
+        expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.85
+        for: 5m
+        labels:
+          severity: warning
+          component: redis
+        annotations:
+          summary: "Redis memory at {{ $value | humanizePercentage }}"
+          description: >
+            Redis is using more than 85% of its 4 GB limit.
+            The LRU eviction policy is active; analytics cache and session state
+            may be evicted prematurely.

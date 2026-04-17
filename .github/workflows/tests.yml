@@ -1,0 +1,177 @@
+name: Backend Tests
+
+on:
+  push:
+    branches: [main, master, develop]
+    paths:
+      - "backend/**"
+      - ".github/workflows/tests.yml"
+      - "docker-compose.test.yml"
+  pull_request:
+    branches: [main, master, develop]
+    paths:
+      - "backend/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (${{ matrix.python-version }})
+    runs-on: ubuntu-22.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11"]
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER:     acas
+          POSTGRES_PASSWORD: acas
+          POSTGRES_DB:       acas_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U acas -d acas_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgresql+asyncpg://acas:acas@localhost:5432/acas_test
+      REDIS_URL:         redis://localhost:6379/1
+      # Minimal settings so Settings() can be instantiated
+      DATABASE_URL:      postgresql+asyncpg://acas:acas@localhost:5432/acas_test
+      TIMESCALE_URL:     postgresql+asyncpg://acas:acas@localhost:5432/acas_test
+      MINIO_ENDPOINT:    localhost:9000
+      MINIO_ACCESS_KEY:  minioadmin
+      MINIO_SECRET_KEY:  minioadmin
+      KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+      MODEL_DIR:         /tmp/acas-test-models
+      GPU_DEVICE_ID:     "0"
+      JWT_SECRET_KEY:    acas-test-hs256-secret-do-not-use-in-production
+      JWT_ALGORITHM:     HS256
+      NODE_ID:           test-node-ci
+      NODE_NAME:         "CI Node"
+      # Signal to the app that it is running in test mode (skip GPU init)
+      ACAS_TEST_MODE:    "1"
+      AI_PIPELINE_DISABLED: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-test.txt
+
+      # Install CPU-only packages that replace GPU ones (no CUDA on CI)
+      - name: Install CPU runtime overrides
+        run: |
+          pip install faiss-cpu Pillow numpy
+
+      # Install the main app dependencies, skipping GPU-only packages
+      - name: Install app dependencies (CPU-safe subset)
+        working-directory: backend
+        run: |
+          # Remove GPU-only lines before installing
+          grep -v -E "(faiss-gpu|onnxruntime-gpu|pycuda|tensorrt)" requirements.txt \
+            | pip install -r /dev/stdin || true
+          # Install onnxruntime CPU fallback
+          pip install onnxruntime
+
+      - name: Install test dependencies
+        working-directory: backend
+        run: pip install -r requirements-test.txt
+
+      - name: Wait for PostgreSQL to be ready
+        run: |
+          for i in {1..30}; do
+            pg_isready -h localhost -p 5432 -U acas && break
+            echo "Waiting for postgres... $i"
+            sleep 2
+          done
+
+      - name: Run tests
+        working-directory: backend
+        run: |
+          pytest tests/ \
+            -v \
+            --tb=short \
+            --timeout=60 \
+            -m "not gpu and not kafka and not minio and not integration" \
+            --cov=app \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --cov-fail-under=60 \
+            -x
+
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v4
+        with:
+          files: backend/coverage.xml
+          flags: backend
+          fail_ci_if_error: false
+
+  # Optional: integration tests that spin up full docker-compose stack
+  integration:
+    name: Integration Tests (full stack)
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build and start test stack
+        run: |
+          docker compose -f docker-compose.test.yml up -d --build
+          sleep 20
+
+      - name: Wait for backend health
+        run: |
+          for i in {1..30}; do
+            curl -sf http://localhost:8000/api/health && break
+            sleep 3
+          done
+
+      - name: Run integration tests
+        env:
+          TEST_DATABASE_URL: postgresql+asyncpg://acas:acas@localhost:5432/acas_test
+        run: |
+          pip install -r backend/requirements-test.txt faiss-cpu
+          cd backend && pytest tests/ -m "integration" -v --timeout=120 || true
+
+      - name: Collect logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.test.yml logs --tail=100
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v

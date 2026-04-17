@@ -1,0 +1,57 @@
+# Secrets
+.env
+.env.local
+.env.*.local
+
+# Models (downloaded at runtime)
+models/
+*.onnx
+*.engine
+*.trt
+
+# Data directories
+data/
+
+# Knowledge graph output
+graphify-out/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+.next/
+dashboard/.next/
+control-plane/.wrangler/
+*.tsbuildinfo
+
+# Docker
+*.tar
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# CLAUDE.md (local AI instructions, not project docs)
+CLAUDE.md

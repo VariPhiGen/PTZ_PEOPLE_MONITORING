@@ -1,0 +1,36 @@
+# Cloudflare Tunnel — file-based configuration (alternative to TUNNEL_TOKEN env var).
+#
+# Setup:
+#   1. Install cloudflared:  https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/install-and-setup/
+#   2. Authenticate:         cloudflared tunnel login
+#   3. Create tunnel:        cloudflared tunnel create acas-node-1
+#   4. Copy UUID from output into `tunnel:` below.
+#   5. Copy credentials JSON to ./config/cloudflared/<UUID>.json
+#   6. Set CLOUDFLARE_TUNNEL_TOKEN="" in .env.prod to use file-based config.
+#
+# OR (simpler) — use the token method:
+#   1. Go to Cloudflare Zero Trust dashboard → Access → Tunnels → Create tunnel.
+#   2. Copy the tunnel token.
+#   3. Set CLOUDFLARE_TUNNEL_TOKEN=<token> in .env.prod.
+#   4. Leave this file untouched — the token takes precedence.
+
+tunnel: <YOUR_TUNNEL_UUID>
+credentials-file: /etc/cloudflared/<YOUR_TUNNEL_UUID>.json
+
+ingress:
+  # ACAS API — all routes go through the backend
+  - hostname: acas-api.your-domain.com
+    service: http://backend:8000
+    originRequest:
+      connectTimeout: 30s
+      noTLSVerify: false
+
+  # WebSocket upgrade support (for /api/sessions/{id}/ws and /api/monitoring/ws)
+  - hostname: acas-api.your-domain.com
+    path: /api/sessions/.*\/ws
+    service: http://backend:8000
+    originRequest:
+      noHappyEyeballs: false
+
+  # Catch-all — return 404 for unmatched hostnames
+  - service: http_status:404

@@ -1,0 +1,550 @@
+# ACAS — Production Compose
+#
+# No host-exposed ports.  All external traffic routes through Cloudflare Tunnel.
+# Internal services communicate over the acas-prod-net bridge network.
+#
+# Usage:
+#   bash scripts/start.sh            — recommended (checks deps, runs migrations)
+#   docker compose -f docker-compose.prod.yml up -d
+#   docker compose -f docker-compose.prod.yml --profile monitoring up -d
+#
+# Required env file:  .env.prod   (copy .env.prod.example and fill in secrets)
+
+x-logging: &json-log
+  driver: json-file
+  options:
+    max-size: "100m"
+    max-file: "5"
+    compress: "true"
+    labels: "service"
+
+# Combined: restart policy + network attachment for every long-running service.
+x-svc: &svc
+  restart: unless-stopped
+  networks:
+    - acas-prod
+
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+
+  # ── FastAPI backend ─────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.gpu
+    image: acas-backend:gpu
+    container_name: acas-backend
+    restart: unless-stopped
+    runtime: nvidia
+    logging: *json-log
+    labels:
+      service: backend
+    environment:
+      NVIDIA_VISIBLE_DEVICES:      ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES:  compute,video,utility
+      DATABASE_URL:                postgresql+asyncpg://acas:${POSTGRES_PASSWORD}@postgres:5432/acas
+      TIMESCALE_URL:               postgresql+asyncpg://acas:${TIMESCALE_PASSWORD}@timescaledb:5432/acas_ts
+      REDIS_URL:                   redis://redis:6379/0
+      MINIO_ENDPOINT:              minio:9000
+      MINIO_ACCESS_KEY:            ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY:            ${MINIO_ROOT_PASSWORD}
+      KAFKA_BOOTSTRAP_SERVERS:     kafka:19092
+      # Backend reads KAFKA_SCHEMA_REGISTRY_URL (see app/config.py)
+      KAFKA_SCHEMA_REGISTRY_URL:   http://schema-registry:8081
+      MODEL_DIR:                   /models
+      GPU_DEVICE_ID:               ${GPU_DEVICE_ID:-0}
+      JWT_SECRET_KEY:              ${JWT_SECRET_KEY}
+      JWT_ALGORITHM:               ${JWT_ALGORITHM:-RS256}
+      CONTROL_PLANE_URL:           ${CONTROL_PLANE_URL:-}
+      NODE_ID:                     ${NODE_ID:-}
+      NODE_NAME:                   ${NODE_NAME:-acas-node-1}
+    volumes:
+      - ./models:/models:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      schema-registry:
+        condition: service_started
+    command: >
+      gunicorn app.main:app
+        --workers 4
+        --worker-class uvicorn.workers.UvicornWorker
+        --bind 0.0.0.0:8000
+        --timeout 120
+        --graceful-timeout 30
+        --keep-alive 5
+        --access-logfile -
+        --error-logfile -
+        --log-level info
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries:  3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 64g
+        reservations:
+          memory: 8g
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video, compute, utility]
+    networks:
+      - acas-prod
+
+  # ── PostgreSQL 16 + pgvector + pg_trgm ──────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: acas-postgres
+    restart: unless-stopped
+    logging: *json-log
+    labels:
+      service: postgres
+    environment:
+      POSTGRES_USER:     acas
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB:       acas
+      PGDATA:            /var/lib/postgresql/data/pgdata
+    volumes:
+      - acas_pg_data:/var/lib/postgresql/data
+      - ./scripts/postgres/init-extensions.sql:/docker-entrypoint-initdb.d/01-init-extensions.sql:ro
+    command: >
+      postgres
+        -c shared_buffers=4GB
+        -c max_connections=200
+        -c effective_cache_size=12GB
+        -c work_mem=64MB
+        -c maintenance_work_mem=1GB
+        -c random_page_cost=1.1
+        -c effective_io_concurrency=200
+        -c checkpoint_completion_target=0.9
+        -c wal_buffers=64MB
+        -c default_statistics_target=100
+        -c synchronous_commit=off
+        -c log_min_duration_statement=1000
+        -c log_checkpoints=on
+        -c log_connections=on
+        -c log_lock_waits=on
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U acas -d acas"]
+      interval: 10s
+      timeout:  5s
+      retries:  10
+      start_period: 30s
+    networks:
+      - acas-prod
+
+  # ── PostgreSQL daily backup sidecar ─────────────────────────────────────────
+  postgres-backup:
+    image: pgvector/pgvector:pg16
+    container_name: acas-pg-backup
+    restart: unless-stopped
+    logging: *json-log
+    labels:
+      service: postgres-backup
+    environment:
+      PGPASSWORD:    ${POSTGRES_PASSWORD}
+      PGHOST:        postgres
+      PGUSER:        acas
+      PGDATABASE:    acas
+      BACKUP_RETAIN: ${BACKUP_RETAIN_DAYS:-14}
+    volumes:
+      - acas_pg_backups:/backups
+      - ./scripts/postgres/backup.sh:/backup.sh:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        chmod +x /backup.sh
+        echo "0 2 * * * /backup.sh" | crontab -
+        crond -f -l 2
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - acas-prod
+
+  # ── TimescaleDB 2.x / compression / retention ───────────────────────────────
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: acas-timescaledb
+    restart: unless-stopped
+    logging: *json-log
+    labels:
+      service: timescaledb
+    environment:
+      POSTGRES_USER:     acas
+      POSTGRES_PASSWORD: ${TIMESCALE_PASSWORD}
+      POSTGRES_DB:       acas_ts
+      PGDATA:            /var/lib/postgresql/data/pgdata
+    volumes:
+      - acas_ts_data:/var/lib/postgresql/data
+      - ./scripts/timescaledb/init-detection-log.sql:/docker-entrypoint-initdb.d/01-init-detection-log.sql:ro
+      - ./scripts/timescaledb/init-compression.sql:/docker-entrypoint-initdb.d/02-init-compression.sql:ro
+    command: >
+      postgres
+        -c shared_buffers=2GB
+        -c max_connections=100
+        -c work_mem=32MB
+        -c maintenance_work_mem=512MB
+        -c checkpoint_completion_target=0.9
+        -c synchronous_commit=off
+        -c timescaledb.max_background_workers=8
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U acas -d acas_ts"]
+      interval: 10s
+      timeout:  5s
+      retries:  10
+      start_period: 30s
+    networks:
+      - acas-prod
+
+  # ── Redis 7 — RDB + AOF ─────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: acas-redis
+    restart: unless-stopped
+    logging: *json-log
+    labels:
+      service: redis
+    command: >
+      redis-server
+        --maxmemory 4gb
+        --maxmemory-policy allkeys-lru
+        --appendonly yes
+        --appendfsync everysec
+        --no-appendfsync-on-rewrite no
+        --auto-aof-rewrite-percentage 100
+        --auto-aof-rewrite-min-size 64mb
+        --save 900 1
+        --save 300 10
+        --save 60 10000
+        --rdbcompression yes
+        --rdbchecksum yes
+        --loglevel notice
+        --protected-mode no
+    volumes:
+      - acas_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout:  3s
+      retries:  5
+    networks:
+      - acas-prod
+
+  # ── MinIO — erasure coding (4 drives) ───────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: acas-minio
+    restart: unless-stopped
+    logging: *json-log
+    labels:
+      service: minio
+    # Distributed erasure-coding across 4 logical volumes on a single node.
+    # MinIO requires ≥4 drives for EC:2+2 (survives loss of 2 drives).
+    command: server /data{1...4} --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER:     ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    volumes:
+      - acas_minio_data1:/data1
+      - acas_minio_data2:/data2
+      - acas_minio_data3:/data3
+      - acas_minio_data4:/data4
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+      timeout:  10s
+      retries:  5
+      start_period: 30s
+    networks:
+      - acas-prod
+
+  # ── MinIO init — buckets + lifecycle policies ────────────────────────────────
+  minio-init:
+    image: minio/mc:latest
+    container_name: acas-minio-init
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until mc alias set acas http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} 2>/dev/null; do
+          echo "Waiting for MinIO…"; sleep 3
+        done
+
+        mc mb --ignore-existing acas/face-enrollment
+        mc mb --ignore-existing acas/face-evidence
+        mc mb --ignore-existing acas/snapshots
+        mc mb --ignore-existing acas/exports
+
+        # Versioning on enrollment (immutable audit trail)
+        mc version enable acas/face-enrollment
+
+        # Lifecycle: expire face-evidence after 30 days
+        mc ilm import acas/face-evidence <<'JSON'
+        {"Rules":[{"ID":"expire-evidence-30d","Status":"Enabled","Filter":{"Prefix":""},"Expiration":{"Days":30}}]}
+        JSON
+
+        # Lifecycle: expire snapshots after 7 days
+        mc ilm import acas/snapshots <<'JSON'
+        {"Rules":[{"ID":"expire-snapshots-7d","Status":"Enabled","Filter":{"Prefix":""},"Expiration":{"Days":7}}]}
+        JSON
+
+        echo "MinIO init complete."
+    environment:
+      MINIO_ROOT_USER:     ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - acas-prod
+
+  # ── Kafka 3.9 KRaft (single broker) ─────────────────────────────────────────
+  kafka:
+    image: apache/kafka:3.9.2
+    hostname: kafka
+    container_name: acas-kafka
+    restart: unless-stopped
+    user: root
+    logging: *json-log
+    labels:
+      service: kafka
+    environment:
+      KAFKA_NODE_ID:                          1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP:   "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_ADVERTISED_LISTENERS:             "PLAINTEXT://kafka:19092"
+      KAFKA_PROCESS_ROLES:                    "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS:         "1@kafka:29093"
+      KAFKA_LISTENERS:                        "CONTROLLER://:29093,PLAINTEXT://:19092"
+      KAFKA_INTER_BROKER_LISTENER_NAME:       "PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES:        "CONTROLLER"
+      CLUSTER_ID:                             "${KAFKA_CLUSTER_ID}"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR:    1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      # Disable auto-creation — kafka-init creates all topics with explicit configs
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE:        "false"
+      KAFKA_LOG_DIRS:                         "/var/lib/kafka/kraft-combined-logs"
+      KAFKA_LOG_RETENTION_HOURS:              168
+      KAFKA_LOG_SEGMENT_BYTES:                1073741824
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS:  300000
+      KAFKA_NUM_PARTITIONS:                   3
+      KAFKA_DEFAULT_REPLICATION_FACTOR:       1
+    volumes:
+      - acas_kafka_data:/var/lib/kafka/kraft-combined-logs
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:19092 || exit 1"]
+      interval: 10s
+      timeout:  10s
+      retries:  12
+      start_period: 45s
+    networks:
+      - acas-prod
+
+  # ── Kafka init — pre-create all 13+1 topics ──────────────────────────────────
+  kafka-init:
+    image: apache/kafka:3.9.2
+    container_name: acas-kafka-init
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        BS=kafka:19092
+        T=/opt/kafka/bin/kafka-topics.sh
+
+        create() {
+          local topic="$1" parts="$2" retention_ms="$3"
+          shift 3
+          $$T --bootstrap-server $$BS --create --if-not-exists \
+            --topic "$$topic" --partitions "$$parts" --replication-factor 1 \
+            --config "retention.ms=$$retention_ms" "$@"
+          echo "  [OK] $$topic"
+        }
+
+        echo "Creating ACAS Kafka topics…"
+        # attendance
+        create attendance.records     6  604800000                                 # 7d
+        create attendance.held        3  2592000000                                # 30d
+        create attendance.faculty     3  604800000                                 # 7d
+        # sightings (high-volume — compact log + short retention)
+        create sightings.log         12  259200000                                 # 3d
+        create sightings.alerts       6  604800000                                 # 7d
+        create sightings.occupancy    6   86400000  --config "cleanup.policy=delete"  # 1d
+        # ERP
+        create erp.sync.requests      3  604800000                                 # 7d
+        create erp.sync.status        3  604800000                                 # 7d
+        # enrollment
+        create enrollment.events      3  2592000000                                # 30d
+        # notifications
+        create notifications.outbound 3  259200000                                 # 3d
+        # system
+        create system.alerts          3  1209600000                                # 14d
+        create audit.events           6  7776000000 --config "cleanup.policy=delete"  # 90d
+        create admin.overrides        3  604800000                                 # 7d
+        # face sync (consumed immediately by peer nodes)
+        create repo.sync.embeddings   6  172800000                                 # 2d
+
+        echo "All 14 topics ready."
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - acas-prod
+
+  # ── Confluent Schema Registry — BACKWARD compatibility ───────────────────────
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.1
+    container_name: acas-schema-registry
+    restart: unless-stopped
+    logging: *json-log
+    labels:
+      service: schema-registry
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME:                    schema-registry
+      SCHEMA_REGISTRY_LISTENERS:                    http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:19092
+      # BACKWARD: new schemas must be backward-compatible with the latest registered
+      SCHEMA_REGISTRY_AVRO_COMPATIBILITY_LEVEL:     BACKWARD
+      SCHEMA_REGISTRY_LOG4J_ROOT_LOGLEVEL:          WARN
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8081/subjects"]
+      interval: 15s
+      timeout:  5s
+      retries:  5
+      start_period: 30s
+    networks:
+      - acas-prod
+
+  # ── Cloudflare Tunnel ────────────────────────────────────────────────────────
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: acas-cloudflared
+    restart: unless-stopped
+    logging: *json-log
+    labels:
+      service: cloudflared
+    # Mode 1: token (recommended — set CLOUDFLARE_TUNNEL_TOKEN in .env.prod)
+    # Mode 2: file-based (set CLOUDFLARE_TUNNEL_TOKEN="" and mount config volume)
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    volumes:
+      # Mounted only when using file-based tunnel (token takes precedence)
+      - ./config/cloudflared:/etc/cloudflared:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - acas-prod
+
+  # ── Prometheus ───────────────────────────────────────────── profile: monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: acas-prometheus
+    restart: unless-stopped
+    logging: *json-log
+    profiles: [monitoring]
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+      - "--web.listen-address=0.0.0.0:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - acas_prometheus_data:/prometheus
+    networks:
+      - acas-prod
+
+  # ── Grafana ──────────────────────────────────────────────── profile: monitoring
+  grafana:
+    image: grafana/grafana:latest
+    container_name: acas-grafana
+    restart: unless-stopped
+    logging: *json-log
+    profiles: [monitoring]
+    environment:
+      GF_SECURITY_ADMIN_USER:     ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-changeme}
+      GF_SERVER_ROOT_URL:         ${GRAFANA_ROOT_URL:-http://localhost:3000}
+      GF_USERS_ALLOW_SIGN_UP:     "false"
+      GF_LOG_LEVEL:               warn
+    volumes:
+      - acas_grafana_data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    networks:
+      - acas-prod
+
+  # ── Node Exporter ────────────────────────────────────────── profile: monitoring
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: acas-node-exporter
+    restart: unless-stopped
+    profiles: [monitoring]
+    pid: host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.rootfs=/rootfs"
+      - "--path.sysfs=/host/sys"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    networks:
+      - acas-prod
+
+  # ── Redis Exporter ───────────────────────────────────────── profile: monitoring
+  redis-exporter:
+    image: oliver006/redis_exporter:latest
+    container_name: acas-redis-exporter
+    restart: unless-stopped
+    profiles: [monitoring]
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    depends_on:
+      - redis
+    networks:
+      - acas-prod
+
+# ─────────────────────────────────────────────────────────────────────────────
+volumes:
+  acas_pg_data:
+  acas_pg_backups:
+  acas_ts_data:
+  acas_redis_data:
+  acas_minio_data1:
+  acas_minio_data2:
+  acas_minio_data3:
+  acas_minio_data4:
+  acas_kafka_data:
+  acas_prometheus_data:
+  acas_grafana_data:
+
+networks:
+  acas-prod:
+    name: acas-prod-net
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

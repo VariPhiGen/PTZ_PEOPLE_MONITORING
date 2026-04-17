@@ -1,0 +1,54 @@
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: acas-node
+    environment: production
+
+rule_files:
+  - "alerts.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []    # configure alertmanager endpoint here
+
+scrape_configs:
+  # ── ACAS backend ──────────────────────────────────────────────────────────
+  - job_name: acas-backend
+    static_configs:
+      - targets: ["backend:8000"]
+    metrics_path: /metrics
+    scrape_interval: 10s
+
+  # ── Redis ─────────────────────────────────────────────────────────────────
+  - job_name: redis
+    static_configs:
+      - targets: ["redis-exporter:9121"]
+
+  # ── Node exporter (host CPU / RAM / disk) ─────────────────────────────────
+  - job_name: node
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  # ── PostgreSQL (pgvector node) ────────────────────────────────────────────
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+    # postgres_exporter: set DATA_SOURCE_NAME in docker-compose.prod.yml
+
+  # ── Kafka (JMX exporter on kafka:7071) ───────────────────────────────────
+  - job_name: kafka
+    static_configs:
+      - targets: ["kafka:7071"]
+
+  # ── MinIO ─────────────────────────────────────────────────────────────────
+  - job_name: minio
+    metrics_path: /minio/v2/metrics/cluster
+    static_configs:
+      - targets: ["minio:9000"]
+
+  # ── Prometheus self-monitoring ────────────────────────────────────────────
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

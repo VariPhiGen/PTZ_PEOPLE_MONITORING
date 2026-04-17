@@ -1,0 +1,42 @@
+name              = "acas-control-plane"
+main              = "src/index.ts"
+compatibility_date = "2024-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+# ── D1 databases ──────────────────────────────────────────────────────────────
+[[d1_databases]]
+binding     = "DB"
+database_name = "acas-db"
+database_id   = "00000000-0000-0000-0000-000000000001"  # replace after `wrangler d1 create acas-db`
+
+# ── KV namespaces ─────────────────────────────────────────────────────────────
+[[kv_namespaces]]
+binding = "ACAS_CONFIG"
+id      = "00000000000000000000000000000001"  # replace after `wrangler kv:namespace create ACAS_CONFIG`
+
+[[kv_namespaces]]
+binding = "ACAS_ROUTING"
+id      = "00000000000000000000000000000002"  # replace after `wrangler kv:namespace create ACAS_ROUTING`
+
+# ── Durable Objects ───────────────────────────────────────────────────────────
+[durable_objects]
+bindings = [
+  { name = "SESSION_RELAY", class_name = "SessionRelay" }
+]
+
+[[migrations]]
+tag         = "v1"
+new_classes = ["SessionRelay"]
+
+# ── Cron triggers ─────────────────────────────────────────────────────────────
+[triggers]
+crons = ["*/5 * * * *"]
+
+# ── Secrets (set via `wrangler secret put`) ───────────────────────────────────
+# JWT_SECRET          — must match backend JWT_SECRET_KEY
+# NODE_AUTH_TOKEN     — shared secret for node → CP heartbeat auth
+#
+# [vars]              — non-sensitive
+[vars]
+ENVIRONMENT         = "production"
+HEARTBEAT_TIMEOUT_S = "900"   # 3 × 5-min cron = 15 min before OFFLINE

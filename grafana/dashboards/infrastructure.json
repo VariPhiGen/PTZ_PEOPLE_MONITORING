@@ -1,0 +1,115 @@
+{
+  "uid": "acas-infra",
+  "title": "ACAS — Infrastructure",
+  "tags": ["acas", "infra"],
+  "refresh": "30s",
+  "time": {"from": "now-3h", "to": "now"},
+  "timezone": "browser",
+  "schemaVersion": 38,
+  "panels": [
+    {
+      "id": 1, "type": "gauge", "title": "GPU Utilisation",
+      "gridPos": {"h": 6, "w": 4, "x": 0, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100,
+        "thresholds": {"steps": [{"color": "green", "value": 0}, {"color": "yellow", "value": 70}, {"color": "red", "value": 90}]}}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [{"datasource": {"uid": "acas-prometheus"}, "expr": "acas_gpu_util_percent", "legendFormat": "GPU {{device_id}}"}]
+    },
+    {
+      "id": 2, "type": "gauge", "title": "GPU VRAM",
+      "gridPos": {"h": 6, "w": 4, "x": 4, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "bytes", "min": 0,
+        "thresholds": {"steps": [{"color": "green", "value": 0}, {"color": "yellow", "value": 17179869184}, {"color": "red", "value": 21474836480}]},
+        "max": 25769803776}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [{"datasource": {"uid": "acas-prometheus"}, "expr": "acas_gpu_vram_used_bytes", "legendFormat": "VRAM used"}]
+    },
+    {
+      "id": 3, "type": "gauge", "title": "CPU",
+      "gridPos": {"h": 6, "w": 4, "x": 8, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100,
+        "thresholds": {"steps": [{"color": "green", "value": 0}, {"color": "yellow", "value": 70}, {"color": "red", "value": 90}]}}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [{"datasource": {"uid": "acas-prometheus"}, "expr": "100 - (avg(rate(node_cpu_seconds_total{mode='idle'}[1m])) * 100)", "legendFormat": "CPU%"}]
+    },
+    {
+      "id": 4, "type": "gauge", "title": "RAM",
+      "gridPos": {"h": 6, "w": 4, "x": 12, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100,
+        "thresholds": {"steps": [{"color": "green", "value": 0}, {"color": "yellow", "value": 75}, {"color": "red", "value": 90}]}}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [{"datasource": {"uid": "acas-prometheus"}, "expr": "(1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100", "legendFormat": "RAM%"}]
+    },
+    {
+      "id": 5, "type": "gauge", "title": "Disk / (data)",
+      "gridPos": {"h": 6, "w": 4, "x": 16, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100,
+        "thresholds": {"steps": [{"color": "green", "value": 0}, {"color": "yellow", "value": 70}, {"color": "red", "value": 85}]}}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [{"datasource": {"uid": "acas-prometheus"}, "expr": "(1 - node_filesystem_avail_bytes{mountpoint='/'} / node_filesystem_size_bytes{mountpoint='/'}) * 100", "legendFormat": "Disk%"}]
+    },
+    {
+      "id": 6, "type": "gauge", "title": "DB Pool Utilisation",
+      "gridPos": {"h": 6, "w": 4, "x": 20, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100,
+        "thresholds": {"steps": [{"color": "green", "value": 0}, {"color": "yellow", "value": 60}, {"color": "red", "value": 85}]}}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}},
+      "targets": [{"datasource": {"uid": "acas-prometheus"}, "expr": "acas_db_pool_checkedout / 30 * 100", "legendFormat": "pool%"}]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "GPU Utilisation & VRAM Over Time",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 6},
+      "fieldConfig": {"overrides": [
+        {"matcher": {"id": "byName", "options": "VRAM used"}, "properties": [{"id": "unit", "value": "bytes"}, {"id": "custom.axisPlacement", "value": "right"}]}
+      ], "defaults": {"unit": "percent"}},
+      "options": {"tooltip": {"mode": "multi"}},
+      "targets": [
+        {"datasource": {"uid": "acas-prometheus"}, "expr": "acas_gpu_util_percent", "legendFormat": "GPU util%"},
+        {"datasource": {"uid": "acas-prometheus"}, "expr": "acas_gpu_vram_used_bytes", "legendFormat": "VRAM used"}
+      ]
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "Host CPU / RAM / Network",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 6},
+      "fieldConfig": {"defaults": {"unit": "percent"}},
+      "options": {"tooltip": {"mode": "multi"}},
+      "targets": [
+        {"datasource": {"uid": "acas-prometheus"}, "expr": "100 - (avg(rate(node_cpu_seconds_total{mode='idle'}[1m])) * 100)", "legendFormat": "CPU%"},
+        {"datasource": {"uid": "acas-prometheus"}, "expr": "(1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100", "legendFormat": "RAM%"}
+      ]
+    },
+    {
+      "id": 9, "type": "timeseries", "title": "FAISS Index Size per Client",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "targets": [{"datasource": {"uid": "acas-prometheus"}, "expr": "acas_faiss_index_size", "legendFormat": "client {{client_id}}"}]
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "MinIO Cluster Storage",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14},
+      "fieldConfig": {"defaults": {"unit": "bytes"}},
+      "targets": [
+        {"datasource": {"uid": "acas-prometheus"}, "expr": "minio_cluster_usage_total_bytes", "legendFormat": "used"},
+        {"datasource": {"uid": "acas-prometheus"}, "expr": "minio_cluster_capacity_raw_total_bytes", "legendFormat": "total"}
+      ]
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "DB Connection Pool",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 22},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "targets": [
+        {"datasource": {"uid": "acas-prometheus"}, "expr": "acas_db_pool_checkedout", "legendFormat": "checked out"},
+        {"datasource": {"uid": "acas-prometheus"}, "expr": "acas_db_pool_overflow", "legendFormat": "overflow"}
+      ]
+    },
+    {
+      "id": 12, "type": "timeseries", "title": "Redis Memory",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 22},
+      "fieldConfig": {"defaults": {"unit": "bytes"}},
+      "targets": [
+        {"datasource": {"uid": "acas-prometheus"}, "expr": "redis_memory_used_bytes", "legendFormat": "used"},
+        {"datasource": {"uid": "acas-prometheus"}, "expr": "redis_memory_max_bytes", "legendFormat": "max"}
+      ]
+    }
+  ]
+}

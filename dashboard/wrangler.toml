@@ -1,0 +1,15 @@
+name            = "acas-dashboard"
+compatibility_date = "2024-09-01"
+compatibility_flags = ["nodejs_compat"]
+pages_build_output_dir = ".vercel/output/static"
+
+# ── Environment Variables ──────────────────────────────────────────────────────
+# Set production values via: wrangler pages secret put <KEY>
+# Or in the Cloudflare Dashboard → Pages → Settings → Environment Variables
+
+[vars]
+NEXT_PUBLIC_API_URL = "https://acas-control-plane.your-subdomain.workers.dev"
+
+# ── Preview environment ────────────────────────────────────────────────────────
+[env.preview.vars]
+NEXT_PUBLIC_API_URL = "https://acas-control-plane-preview.your-subdomain.workers.dev"

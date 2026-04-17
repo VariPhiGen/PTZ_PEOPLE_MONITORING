@@ -1,0 +1,86 @@
+version: "3.9"
+
+# Lightweight test stack: PostgreSQL + Redis + backend only.
+# Kafka, MinIO, and Schema Registry are excluded — services are mocked in tests.
+#
+# Usage:
+#   docker compose -f docker-compose.test.yml up -d --build
+#   docker compose -f docker-compose.test.yml exec backend \
+#       pytest tests/ -m "not gpu" -v
+#   docker compose -f docker-compose.test.yml down -v
+
+networks:
+  acas-test:
+    driver: bridge
+
+volumes:
+  pg-test-data:
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER:     acas
+      POSTGRES_PASSWORD: acas
+      POSTGRES_DB:       acas_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U acas -d acas_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - acas-test
+    volumes:
+      - pg-test-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - acas-test
+
+  backend:
+    build:
+      context: backend
+      dockerfile: Dockerfile.gpu
+      target: test          # multi-stage: 'test' stage uses CPU-only deps
+    command: >
+      sh -c "
+        pip install -r requirements-test.txt faiss-cpu --quiet &&
+        pytest tests/ -m 'not gpu and not kafka and not minio and not integration'
+          --tb=short -v --timeout=60
+      "
+    environment:
+      DATABASE_URL:         postgresql+asyncpg://acas:acas@postgres:5432/acas_test
+      TIMESCALE_URL:        postgresql+asyncpg://acas:acas@postgres:5432/acas_test
+      TEST_DATABASE_URL:    postgresql+asyncpg://acas:acas@postgres:5432/acas_test
+      REDIS_URL:            redis://redis:6379/1
+      MINIO_ENDPOINT:       localhost:9000
+      MINIO_ACCESS_KEY:     minioadmin
+      MINIO_SECRET_KEY:     minioadmin
+      KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+      MODEL_DIR:            /tmp/acas-test-models
+      GPU_DEVICE_ID:        "0"
+      JWT_SECRET_KEY:       acas-test-hs256-secret-do-not-use-in-production
+      JWT_ALGORITHM:        HS256
+      NODE_ID:              test-node-docker
+      NODE_NAME:            "Docker Test Node"
+      ACAS_TEST_MODE:       "1"
+      AI_PIPELINE_DISABLED: "1"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    networks:
+      - acas-test
+    volumes:
+      - ./backend:/app
+    working_dir: /app

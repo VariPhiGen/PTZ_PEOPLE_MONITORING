@@ -1,0 +1,79 @@
+{
+  "uid": "acas-kafka",
+  "title": "ACAS — Kafka",
+  "tags": ["acas", "kafka"],
+  "refresh": "30s",
+  "time": {"from": "now-1h", "to": "now"},
+  "timezone": "browser",
+  "schemaVersion": 38,
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Total Produce Rate / sec",
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "thresholds"},
+        "thresholds": {"steps": [{"color": "green", "value": 0}]}}},
+      "targets": [{"datasource": {"uid": "acas-prometheus"}, "expr": "sum(rate(acas_kafka_produce_total{status='ok'}[1m]))", "legendFormat": "ok/s"}]
+    },
+    {
+      "id": 2, "type": "stat", "title": "Produce Error Rate",
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "color": {"mode": "thresholds"},
+        "thresholds": {"steps": [{"color": "green", "value": 0}, {"color": "yellow", "value": 0.01}, {"color": "red", "value": 0.05}]}}},
+      "targets": [{"datasource": {"uid": "acas-prometheus"}, "expr": "sum(rate(acas_kafka_produce_total{status='error'}[5m])) / sum(rate(acas_kafka_produce_total[5m]))", "legendFormat": "error%"}]
+    },
+    {
+      "id": 3, "type": "stat", "title": "Max Consumer Lag",
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "short", "color": {"mode": "thresholds"},
+        "thresholds": {"steps": [{"color": "green", "value": 0}, {"color": "yellow", "value": 100}, {"color": "red", "value": 1000}]}}},
+      "targets": [{"datasource": {"uid": "acas-prometheus"}, "expr": "max(acas_kafka_consumer_lag)", "legendFormat": "max lag"}]
+    },
+    {
+      "id": 4, "type": "stat", "title": "Produce P95 Latency",
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "ms", "color": {"mode": "thresholds"},
+        "thresholds": {"steps": [{"color": "green", "value": 0}, {"color": "yellow", "value": 25}, {"color": "red", "value": 100}]}}},
+      "targets": [{"datasource": {"uid": "acas-prometheus"}, "expr": "histogram_quantile(0.95, sum(rate(acas_kafka_produce_latency_seconds_bucket[5m])) by (le)) * 1000", "legendFormat": "p95"}]
+    },
+    {
+      "id": 5, "type": "stat", "title": "Local Produce/sec",
+      "gridPos": {"h": 4, "w": 4, "x": 16, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "targets": [{"datasource": {"uid": "acas-prometheus"}, "expr": "sum(rate(acas_kafka_produce_total{cluster='local',status='ok'}[1m]))", "legendFormat": "local"}]
+    },
+    {
+      "id": 6, "type": "stat", "title": "Central Produce/sec",
+      "gridPos": {"h": 4, "w": 4, "x": 20, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "targets": [{"datasource": {"uid": "acas-prometheus"}, "expr": "sum(rate(acas_kafka_produce_total{cluster='central',status='ok'}[1m]))", "legendFormat": "central"}]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "Produce Rate by Topic (ok/sec)",
+      "gridPos": {"h": 8, "w": 16, "x": 0, "y": 4},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "options": {"tooltip": {"mode": "multi"}},
+      "targets": [{"datasource": {"uid": "acas-prometheus"}, "expr": "sum by(topic)(rate(acas_kafka_produce_total{status='ok'}[1m]))", "legendFormat": "{{topic}}"}]
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "Consumer Lag by Topic",
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 4},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "targets": [{"datasource": {"uid": "acas-prometheus"}, "expr": "acas_kafka_consumer_lag", "legendFormat": "{{topic}} / {{group}}"}]
+    },
+    {
+      "id": 9, "type": "timeseries", "title": "Produce Latency Percentiles (ms)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "fieldConfig": {"defaults": {"unit": "ms"}},
+      "targets": [
+        {"datasource": {"uid": "acas-prometheus"}, "expr": "histogram_quantile(0.50, sum by(topic, le)(rate(acas_kafka_produce_latency_seconds_bucket[5m]))) * 1000", "legendFormat": "p50 {{topic}}"},
+        {"datasource": {"uid": "acas-prometheus"}, "expr": "histogram_quantile(0.95, sum by(topic, le)(rate(acas_kafka_produce_latency_seconds_bucket[5m]))) * 1000", "legendFormat": "p95 {{topic}}"}
+      ]
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "Produce Errors by Topic (rate/min)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "targets": [{"datasource": {"uid": "acas-prometheus"}, "expr": "sum by(topic)(rate(acas_kafka_produce_total{status='error'}[1m])) * 60", "legendFormat": "{{topic}} errors/min"}]
+    }
+  ]
+}
