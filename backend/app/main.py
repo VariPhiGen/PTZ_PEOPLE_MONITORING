@@ -234,6 +234,11 @@ async def _on_camera_assigned(camera_id: str, config: Any) -> None:
         _now         = int(__import__("time").time())
 
         # Insert a DB row so /api/sessions/active returns this session
+        from datetime import datetime, timezone
+        try:
+            from zoneinfo import ZoneInfo as _ZI
+        except ImportError:
+            _ZI = None  # type: ignore[assignment,misc]
         try:
             session_factory = getattr(app_ref.state, "session_factory", None)
             if session_factory:
@@ -251,20 +256,112 @@ async def _on_camera_assigned(camera_id: str, config: Any) -> None:
                         {"cid": client_id},
                     )
                     _enrolled_count = int((_ecnt_row.scalar() or 0))
+
+                    # Look up the camera's timetable + current course in the
+                    # timetable's declared timezone (not container UTC).
+                    _course_id:   str | None = None
+                    _course_name: str | None = None
+                    _tt_faculty:  str | None = None
+                    _sched_start: int  | None = None
+                    _sched_end:   int  | None = None
+                    try:
+                        _tt_row = await _sess.execute(
+                            _text("""
+                                SELECT c.timetable_id::text, t.timezone
+                                FROM cameras c
+                                LEFT JOIN timetables t ON t.timetable_id = c.timetable_id
+                                WHERE c.camera_id = (:camid)::uuid
+                            """),
+                            {"camid": camera_id},
+                        )
+                        _tt_fetch = _tt_row.first()
+                        _tt_id = _tt_fetch[0] if _tt_fetch else None
+                        _tz_name = (_tt_fetch[1] if _tt_fetch else None) or "UTC"
+                        if _tt_id:
+                            _tz = timezone.utc
+                            if _ZI is not None:
+                                try:
+                                    _tz = _ZI(_tz_name)
+                                except Exception:
+                                    logger.warning(
+                                        "Auto-start: unknown timezone %r on timetable %s; using UTC",
+                                        _tz_name, _tt_id,
+                                    )
+                            _nl = datetime.now(_tz)
+                            _dow = _nl.weekday()
+                            _hhmm = _nl.strftime("%H:%M")
+                            _ent_rows = await _sess.execute(
+                                _text("""
+                                    SELECT course_id::text, course_name,
+                                           faculty_id::text, start_time, end_time
+                                    FROM timetable_entries
+                                    WHERE timetable_id = (:tid)::uuid
+                                      AND day_of_week = :dow
+                                    ORDER BY start_time
+                                """),
+                                {"tid": _tt_id, "dow": _dow},
+                            )
+                            _ent_list = _ent_rows.fetchall()
+                            for _cid_s, _cn, _fid_s, _st, _et in _ent_list:
+                                if _st <= _hhmm < _et:
+                                    _course_id   = _cid_s
+                                    _course_name = _cn
+                                    _tt_faculty  = _fid_s
+                                    try:
+                                        _today = _nl.date()
+                                        _shm, _ssm = (int(x) for x in _st.split(":"))
+                                        _ehm, _esm = (int(x) for x in _et.split(":"))
+                                        _sched_start = int(datetime(
+                                            _today.year, _today.month, _today.day,
+                                            _shm, _ssm, tzinfo=_tz,
+                                        ).timestamp())
+                                        _sched_end = int(datetime(
+                                            _today.year, _today.month, _today.day,
+                                            _ehm, _esm, tzinfo=_tz,
+                                        ).timestamp())
+                                    except Exception:
+                                        _sched_start = _sched_end = None
+                                    break
+                            if _course_name is None:
+                                logger.info(
+                                    "Auto-start: no timetable entry matched "
+                                    "tid=%s dow=%s hhmm=%s tz=%s (%d rows)",
+                                    _tt_id, _dow, _hhmm, _tz_name, len(_ent_list),
+                                )
+                    except Exception as _tt_exc:
+                        logger.warning(
+                            "Auto-start: timetable lookup failed for camera %s: %s",
+                            camera_id, _tt_exc, exc_info=True,
+                        )
+
                     await _sess.execute(
                         _text("""
                             INSERT INTO sessions
                                 (session_id, client_id, camera_id,
+                                 course_id, course_name, faculty_id,
+                                 scheduled_start, scheduled_end,
                                  actual_start, sync_status, cycle_count,
                                  enrolled_count, created_at)
                             VALUES
                                 ((:sid)::uuid, (:cid)::uuid, (:camid)::uuid,
+                                 :course_id, :course_name,
+                                 (:faculty_id)::uuid,
+                                 :sched_start, :sched_end,
                                  :now, 'PENDING', 0, :enrolled, :now)
                             ON CONFLICT (session_id) DO NOTHING
                         """),
-                        {"sid": session_id, "cid": client_id,
-                         "camid": camera_id, "now": _now,
-                         "enrolled": _enrolled_count},
+                        {
+                            "sid":         session_id,
+                            "cid":         client_id,
+                            "camid":       camera_id,
+                            "course_id":   _course_id,
+                            "course_name": _course_name,
+                            "faculty_id":  _tt_faculty or faculty_id,
+                            "sched_start": _sched_start,
+                            "sched_end":   _sched_end,
+                            "now":         _now,
+                            "enrolled":    _enrolled_count,
+                        },
                     )
                     await _sess.commit()
         except Exception as _exc:

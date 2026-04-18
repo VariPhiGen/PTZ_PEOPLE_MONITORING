@@ -904,10 +904,20 @@ class FaceRepository:
             embedding:  [512] float32 L2-normalised query embedding.
             roster_ids: Persons expected in this context (e.g. today's class).
             thresholds: {"tier1": float, "tier2": float} — optional overrides.
+                        When omitted, per-dataset calibrated thresholds are
+                        loaded from `face_datasets` (set by
+                        `scripts/calibrate_thresholds.py`); fall back to
+                        self._tier1 / self._tier2 if the dataset has not been
+                        calibrated yet.
             dataset_id: Restrict to a specific dataset; None = all client datasets.
         """
-        t1 = (thresholds or {}).get("tier1", self._tier1)
-        t2 = (thresholds or {}).get("tier2", self._tier2)
+        override = thresholds or {}
+        if "tier1" in override and "tier2" in override:
+            t1, t2 = float(override["tier1"]), float(override["tier2"])
+        else:
+            t1_cal, t2_cal = await self._load_dataset_thresholds(client_id, dataset_id)
+            t1 = float(override.get("tier1", t1_cal if t1_cal is not None else self._tier1))
+            t2 = float(override.get("tier2", t2_cal if t2_cal is not None else self._tier2))
 
         # ── Tier-1 FAISS ──────────────────────────────────────────────────────
         # Always run FAISS: roster-scoped when roster provided, all-persons otherwise.
@@ -1123,6 +1133,52 @@ class FaceRepository:
             ci.whiten_mean is not None,
         )
         return n
+
+    async def _load_dataset_thresholds(
+        self,
+        client_id: str,
+        dataset_id: str | None,
+    ) -> tuple[float | None, float | None]:
+        """
+        Return (tier1, tier2) calibrated thresholds for the given scope.
+
+        If ``dataset_id`` is provided, read that dataset's columns directly.
+        Otherwise average across all ACTIVE datasets for the client — that
+        preserves the spirit of per-dataset calibration even when identify()
+        is called without a dataset filter.  If no dataset is calibrated, we
+        return (None, None) and the caller falls back to the global defaults.
+        """
+        if dataset_id:
+            sql = text("""
+                SELECT tier1_threshold AS t1, tier2_threshold AS t2
+                FROM face_datasets
+                WHERE dataset_id = (:did)::uuid
+                LIMIT 1
+            """)
+            params = {"did": dataset_id}
+        else:
+            sql = text("""
+                SELECT AVG(tier1_threshold) AS t1, AVG(tier2_threshold) AS t2
+                FROM face_datasets
+                WHERE client_id = (:cid)::uuid
+                  AND status = 'ACTIVE'
+                  AND tier1_threshold IS NOT NULL
+                  AND tier2_threshold IS NOT NULL
+            """)
+            params = {"cid": client_id}
+
+        try:
+            async with self._session() as db:
+                row = (await db.execute(sql, params)).fetchone()
+        except Exception as exc:  # e.g. migration 0013 not yet applied
+            logger.debug("dataset threshold lookup failed: %s", exc)
+            return None, None
+
+        if not row:
+            return None, None
+        t1 = float(row.t1) if row.t1 is not None else None
+        t2 = float(row.t2) if row.t2 is not None else None
+        return t1, t2
 
     async def _load_embeddings_from_db(
         self,

@@ -89,8 +89,23 @@ _PERSON_TRACK_POLL_S    = 0.10   # control-loop interval — 10 Hz (was 5 Hz / 2
 _PERSON_TRACK_BODY_FRAC = 0.45   # target: person body fills this fraction of frame height
 _PERSON_MIN_BODY_FRAC   = 0.08   # ignore persons whose body height < 8% of frame (too small / background)
 _FACE_HUNT_FRAMES_NEEDED = 2     # face must appear in N consecutive frames before triggering FACE_HUNT
-_UNKNOWN_DEDUP_THRESHOLD = 0.55  # cosine similarity above this → same unknown person → skip saving duplicate
-_UNKNOWN_SESSION_CAP     = 300   # max embeddings kept in session dedup cache
+_UNKNOWN_DEDUP_THRESHOLD = 0.45  # cosine similarity above this → same unknown person → skip saving duplicate
+_UNKNOWN_SESSION_CAP     = 500   # max embeddings kept in session dedup cache
+
+# Commercial-grade quality gates for unknown-face capture.  The admin UI fills
+# up with useless thumbnails when every blurry / angled / cropped face that
+# failed recognition is persisted; these gates eliminate those at source.
+_UNKNOWN_MIN_FACE_CONF   = 0.70   # SCRFD detection confidence floor
+_UNKNOWN_MIN_IOD_PX      = 28.0   # inter-ocular distance — rejects tiny / cropped faces
+_UNKNOWN_MAX_YAW_DEG     = 25.0   # absolute yaw — rejects profile / angled shots
+_UNKNOWN_MAX_PITCH_DEG   = 20.0   # absolute pitch
+_UNKNOWN_MIN_SHARPNESS   = 60.0   # Laplacian variance on the aligned chip — rejects motion blur
+_UNKNOWN_MIN_LIVENESS    = 0.50   # fused temporal liveness floor (was 0.35)
+
+# Persistent cross-session dedup memory (Redis).  Prevents the same unknown
+# person being saved over and over across PTZ cycles and service restarts.
+_UNKNOWN_REDIS_TTL_S     = 86400  # 24 h rolling window
+_UNKNOWN_REDIS_CAP       = 1000   # max embeddings retained per client
 
 # ── Person-tracking controller (continuous_move, P-only) ───────────────────
 # Derivative term removed: at a variable poll period (50–200 ms depending on
@@ -632,6 +647,9 @@ class PTZBrain:
         # A new unknown face is only saved if its cosine similarity to every
         # previously saved unknown is below _UNKNOWN_DEDUP_THRESHOLD.
         self._unknown_seen_embeddings: list[np.ndarray] = []
+        # Lazy-loaded flag: on first dedup check we seed the cache from Redis
+        # so duplicates persist across cycles / process restarts (24 h window).
+        self._unknown_seen_loaded: bool = False
 
         # Faces awaiting FACE_HUNT (set during CELL_RECOGNIZE)
         self._unrec_for_hunt: list[FaceWithEmbedding] = []
@@ -1641,39 +1659,22 @@ class PTZBrain:
                 self._unknown_count += 1
                 unrecognized.append(fwe)
                 # Collect a sample chip for unknown_detections (cap at 3 per cycle).
-                # Only store chips from genuinely live, non-blank faces — skip chips
-                # that were rejected by the liveness gate (non-face surfaces like walls
-                # and lights score very low on MiniFASNet and produce white/blank crops).
+                # Quality + dedup gates live in _unknown_chip_gate(); passing chips
+                # get a context-padded frame crop (hair + shoulders visible) rather
+                # than the tight 112×112 ArcFace chip.
                 if len(self._unknown_chips) < 3 and fwe.face_chip is not None:
-                    live = fwe.liveness   # correct attribute name (not liveness_score)
-                    conf = fwe.face.conf  # correct attribute name (not det_score)
-                    # Reject liveness-failed chips (< 0.35 threshold mirrors _identify gate)
-                    if live < 0.35:
-                        pass  # non-face surface / spoof — do not store
-                    else:
-                        # Extra guard: reject visually blank chips (mean > 200 or std < 15)
-                        chip_gray = cv2.cvtColor(fwe.face_chip, cv2.COLOR_BGR2GRAY)
-                        chip_mean = float(chip_gray.mean())
-                        chip_std  = float(chip_gray.std())
-                        if chip_mean > 200 or chip_std < 15:
-                            pass  # overexposed / featureless patch — do not store
-                        else:
-                            # Dedup: skip if a similar unknown was already saved this session.
-                            # Cosine similarity on L2-normalised embeddings = dot product.
-                            emb = fwe.embedding
-                            is_dup = False
-                            if emb is not None and len(self._unknown_seen_embeddings) > 0:
-                                gallery = np.stack(self._unknown_seen_embeddings)
-                                sims    = gallery @ emb
-                                is_dup  = float(sims.max()) >= _UNKNOWN_DEDUP_THRESHOLD
-                            if not is_dup:
-                                self._unknown_chips.append((fwe.face_chip, conf, live))
-                                if emb is not None:
-                                    self._unknown_seen_embeddings.append(emb)
-                                    # Cap cache to avoid unbounded RAM growth over long sessions
-                                    if len(self._unknown_seen_embeddings) > _UNKNOWN_SESSION_CAP:
-                                        self._unknown_seen_embeddings = \
-                                            self._unknown_seen_embeddings[-_UNKNOWN_SESSION_CAP:]
+                    if await self._unknown_chip_gate(fwe):
+                        crop = self._padded_face_crop(fwe)
+                        if crop is None:
+                            crop = fwe.face_chip
+                        self._unknown_chips.append(
+                            (crop, fwe.face.conf, fwe.liveness, fwe.embedding)
+                        )
+                        if fwe.embedding is not None:
+                            self._unknown_seen_embeddings.append(fwe.embedding)
+                            if len(self._unknown_seen_embeddings) > _UNKNOWN_SESSION_CAP:
+                                self._unknown_seen_embeddings = \
+                                    self._unknown_seen_embeddings[-_UNKNOWN_SESSION_CAP:]
 
         # Update per-preset face counter (total unique faces: recognised + unknown)
         self._preset_cur_faces[location] = (
@@ -4396,7 +4397,8 @@ class PTZBrain:
         now    = int(time.time())
 
         rows = []
-        for chip, conf, live in self._unknown_chips:
+        saved_embs: list[np.ndarray] = []
+        for chip, conf, live, emb in self._unknown_chips:
             try:
                 ok, buf = cv2.imencode(".jpg", chip, [cv2.IMWRITE_JPEG_QUALITY, 88])
                 if not ok:
@@ -4432,6 +4434,8 @@ class PTZBrain:
                     "live":      float(live) if live is not None else None,
                     "det_at":    now,
                 })
+                if emb is not None:
+                    saved_embs.append(emb)
             except Exception as exc:
                 logger.debug("Unknown chip save error: %s", exc)
 
@@ -4457,6 +4461,135 @@ class PTZBrain:
                 await db.commit()
         except Exception as exc:
             logger.warning("unknown_detections insert failed: %s", exc)
+            return
+
+        # Mirror the saved embeddings into Redis for cross-session dedup.
+        await self._persist_unknown_embeddings(cfg.client_id, saved_embs)
+
+    # ── Unknown-face quality gate + helpers ──────────────────────────────────
+
+    async def _unknown_chip_gate(self, fwe: FaceWithEmbedding) -> bool:
+        """
+        True iff this unrecognised face is worth persisting.
+
+        Gates (all must pass):
+          • liveness (fused temporal) ≥ _UNKNOWN_MIN_LIVENESS
+          • SCRFD confidence           ≥ _UNKNOWN_MIN_FACE_CONF
+          • inter-ocular distance      ≥ _UNKNOWN_MIN_IOD_PX
+          • |yaw| ≤ _UNKNOWN_MAX_YAW_DEG and |pitch| ≤ _UNKNOWN_MAX_PITCH_DEG
+            (3D pose if available; falls back to 0° when the pose head is
+            disabled, which keeps the gate permissive for that case)
+          • Laplacian sharpness on the aligned chip ≥ _UNKNOWN_MIN_SHARPNESS
+          • chip is not overexposed / featureless
+          • embedding is not within _UNKNOWN_DEDUP_THRESHOLD of any already-saved
+            unknown for this client in the last 24 h
+        """
+        if fwe.liveness < _UNKNOWN_MIN_LIVENESS:
+            return False
+        if fwe.face.conf < _UNKNOWN_MIN_FACE_CONF:
+            return False
+        if float(fwe.face.inter_ocular_px) < _UNKNOWN_MIN_IOD_PX:
+            return False
+        if abs(fwe.yaw) > _UNKNOWN_MAX_YAW_DEG or abs(fwe.pitch) > _UNKNOWN_MAX_PITCH_DEG:
+            return False
+
+        try:
+            gray = cv2.cvtColor(fwe.face_chip, cv2.COLOR_BGR2GRAY)
+        except Exception:
+            return False
+        if float(cv2.Laplacian(gray, cv2.CV_64F).var()) < _UNKNOWN_MIN_SHARPNESS:
+            return False
+        if float(gray.mean()) > 200.0 or float(gray.std()) < 15.0:
+            return False
+
+        emb = fwe.embedding
+        if emb is not None:
+            if not self._unknown_seen_loaded:
+                await self._load_persistent_unknowns()
+                self._unknown_seen_loaded = True
+            if self._unknown_seen_embeddings:
+                gallery = np.stack(self._unknown_seen_embeddings)
+                if float((gallery @ emb).max()) >= _UNKNOWN_DEDUP_THRESHOLD:
+                    return False
+        return True
+
+    def _padded_face_crop(self, fwe: FaceWithEmbedding) -> np.ndarray | None:
+        """
+        Crop the last full frame around ``fwe.face.bbox`` with generous padding
+        so the stored image shows face + hair + shoulders.  The 112×112 aligned
+        ArcFace chip is too tight for human review.
+        """
+        frame = self._last_frame
+        if frame is None or fwe.face.bbox is None:
+            return None
+        h, w = frame.shape[:2]
+        try:
+            x1, y1, x2, y2 = fwe.face.bbox.astype(float)
+        except Exception:
+            return None
+        bw = x2 - x1
+        bh = y2 - y1
+        if bw <= 2.0 or bh <= 2.0:
+            return None
+        pad_x   = bw * 0.55
+        pad_top = bh * 0.45
+        pad_bot = bh * 0.65
+        cx1 = int(max(0, x1 - pad_x))
+        cy1 = int(max(0, y1 - pad_top))
+        cx2 = int(min(w, x2 + pad_x))
+        cy2 = int(min(h, y2 + pad_bot))
+        if cx2 - cx1 < 32 or cy2 - cy1 < 32:
+            return None
+        return frame[cy1:cy2, cx1:cx2].copy()
+
+    async def _load_persistent_unknowns(self) -> None:
+        """Seed the dedup cache from the Redis 24 h rolling window."""
+        if self._redis is None or self._cfg is None:
+            return
+        import base64 as _b64
+        key = f"acas:unknown:seen:{self._cfg.client_id}"
+        try:
+            members = await self._redis.lrange(key, 0, -1)
+        except Exception:
+            return
+        for m in members or []:
+            try:
+                data = _b64.b64decode(m)
+                emb = np.frombuffer(data, dtype=np.float16).astype(np.float32)
+                if emb.size != 512:
+                    continue
+                n = float(np.linalg.norm(emb))
+                if n < 1e-6:
+                    continue
+                self._unknown_seen_embeddings.append(emb / n)
+            except Exception:
+                continue
+        if len(self._unknown_seen_embeddings) > _UNKNOWN_SESSION_CAP:
+            self._unknown_seen_embeddings = \
+                self._unknown_seen_embeddings[-_UNKNOWN_SESSION_CAP:]
+
+    async def _persist_unknown_embeddings(
+        self,
+        client_id: str,
+        embs: list[np.ndarray],
+    ) -> None:
+        """Push newly-saved unknown embeddings to Redis (fp16, base64)."""
+        if self._redis is None or not embs:
+            return
+        import base64 as _b64
+        key = f"acas:unknown:seen:{client_id}"
+        try:
+            pipe = self._redis.pipeline()
+            for e in embs:
+                data = _b64.b64encode(
+                    e.astype(np.float16).tobytes()
+                ).decode("ascii")
+                pipe.rpush(key, data)
+            pipe.ltrim(key, -_UNKNOWN_REDIS_CAP, -1)
+            pipe.expire(key, _UNKNOWN_REDIS_TTL_S)
+            await pipe.execute()
+        except Exception as exc:
+            logger.debug("persist unknown embeddings failed: %s", exc)
 
     def _kafka_produce(self, topic: str, key: str, payload: dict) -> None:
         if self._kafka is None:

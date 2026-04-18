@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import platform
 import time
 import uuid
@@ -30,6 +31,8 @@ from app.models.cameras import Camera
 from app.models.sessions import Session, SyncStatus
 
 router = APIRouter(prefix="/api/node", tags=["node"])
+
+logger = logging.getLogger(__name__)
 
 _INFO  = require_permission("cameras:read")
 _ADMIN = require_permission("system:admin")
@@ -293,7 +296,23 @@ async def start_camera(
         cam_timetable_id = getattr(cam, "timetable_id", None)
         if cam_timetable_id:
             from datetime import datetime as _dt
-            _now = _dt.now()
+            from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+            tz_row = await db.execute(
+                text("SELECT timezone FROM timetables WHERE timetable_id = (:tid)::uuid"),
+                {"tid": str(cam_timetable_id)},
+            )
+            tz_name = (tz_row.scalar() or "UTC").strip() or "UTC"
+            try:
+                tz = ZoneInfo(tz_name)
+            except ZoneInfoNotFoundError:
+                logger.warning(
+                    "timetable %s has unknown timezone %r; falling back to UTC",
+                    cam_timetable_id, tz_name,
+                )
+                tz = ZoneInfo("UTC")
+
+            _now = _dt.now(tz)
             _dow = _now.weekday()
             _hhmm = _now.strftime("%H:%M")
             tt_rows = await db.execute(
@@ -306,7 +325,8 @@ async def start_camera(
                 """),
                 {"tid": str(cam_timetable_id), "dow": _dow},
             )
-            for _cid, _cn, _fid, _st, _et in tt_rows.fetchall():
+            rows = tt_rows.fetchall()
+            for _cid, _cn, _fid, _st, _et in rows:
                 if _st <= _hhmm < _et:
                     timetable_course_id   = str(_cid) if _cid else None
                     timetable_course_name = _cn
@@ -314,8 +334,13 @@ async def start_camera(
                     timetable_start       = _st
                     timetable_end         = _et
                     break
-    except Exception:
-        pass  # non-fatal; session proceeds without course info
+            if timetable_course_name is None:
+                logger.info(
+                    "no timetable entry matched tid=%s dow=%s hhmm=%s tz=%s (%d candidate rows)",
+                    cam_timetable_id, _dow, _hhmm, tz_name, len(rows),
+                )
+    except Exception as exc:
+        logger.warning("timetable lookup failed for camera %s: %s", camera_id, exc, exc_info=True)
 
     # ── Auto-create session row ────────────────────────────────────────────
     if body.session_id:

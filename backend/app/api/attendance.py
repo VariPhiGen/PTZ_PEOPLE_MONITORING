@@ -826,14 +826,43 @@ async def _enroll_unknown_chip(app, client_id: str, person_id: str, image_ref: s
             _logger.warning("_enroll_unknown_chip: image decode failed for %s", image_ref)
             return
 
-        # Resize to exactly 112×112 if needed (chip should already be that size)
-        if chip.shape[:2] != (112, 112):
-            chip = _cv2.resize(chip, (112, 112))
+        # ── 3. Embed ─────────────────────────────────────────────────────────
+        # As of the unknown-face quality upgrade, chips stored in face-evidence
+        # are context-padded frame crops (~200–400 px) rather than the legacy
+        # 112×112 aligned ArcFace chips.  We try detection + alignment first;
+        # if that fails (e.g. legacy chip from before the upgrade, or a crop
+        # too tight for SCRFD), we fall back to the direct-embed path.
+        emb = None
+        aligned: _np.ndarray | None = None
+        try:
+            h_, w_ = chip.shape[:2]
+            if min(h_, w_) >= 112 and max(h_, w_) > 150:
+                frame_for_det = chip
+                # Upscale small padded crops so SCRFD has enough pixels
+                if max(h_, w_) < 240:
+                    scale = 240.0 / float(max(h_, w_))
+                    frame_for_det = _cv2.resize(
+                        chip, (int(w_ * scale), int(h_ * scale)),
+                        interpolation=_cv2.INTER_LINEAR,
+                    )
+                result = await asyncio.to_thread(pipeline.process_frame, frame_for_det)
+                faces = getattr(result, "faces_with_embeddings", None) or []
+                if faces:
+                    # Largest face wins (handles bystanders in padded crop)
+                    def _area(f):
+                        b = f.face.bbox
+                        return float((b[2] - b[0]) * (b[3] - b[1]))
+                    best = max(faces, key=_area)
+                    emb = best.embedding
+                    aligned = best.face_chip
+        except Exception as exc:
+            _logger.debug("_enroll_unknown_chip: process_frame failed: %s", exc)
 
-        # ── 3. Embed — use get_embedding() directly (chip is pre-aligned) ────
-        # process_frame() runs YOLO+SCRFD which fail on tight face crops.
-        # get_embedding() goes straight to ArcFace on the aligned 112×112 chip.
-        emb = await asyncio.to_thread(pipeline.get_embedding, chip)
+        if emb is None:
+            # Legacy path: treat the image as a pre-aligned 112×112 chip
+            legacy = chip if chip.shape[:2] == (112, 112) else _cv2.resize(chip, (112, 112))
+            emb = await asyncio.to_thread(pipeline.get_embedding, legacy)
+            aligned = legacy
         if emb is None or not hasattr(emb, '__len__') or len(emb) == 0:
             _logger.warning("_enroll_unknown_chip: embedding failed for %s", image_ref)
             return

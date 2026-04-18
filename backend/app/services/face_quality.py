@@ -275,6 +275,52 @@ class FaceQualityAssessor:
         brightness_score = _linear_score(mean, self._ILLUM_GOOD, self._ILLUM_GOOD + 60.0)
         return 0.5 * brightness_score + 0.5 * contrast_score
 
+    def refine_with_3d_pose(
+        self,
+        score: FaceQualityScore,
+        yaw_deg: float,
+        pitch_deg: float,
+    ) -> FaceQualityScore:
+        """
+        Recompute the pose-dependent portion of an existing quality score using
+        accurate yaw/pitch from a 3D-landmark model (1k3d68).  Leaves all other
+        components (size, blur, illumination, occlusion) untouched.
+
+        Mutates ``score`` in place and also returns it for chaining.  Intended
+        to be called *after* the expensive 3D pose stage on recognition-quality
+        faces — keeps the cheap heuristic intact for the initial gate.
+        """
+        abs_yaw = abs(yaw_deg)
+        if abs_yaw <= self._YAW_FRONTAL:
+            yaw_s = 1.0
+        else:
+            yaw_s = max(0.0, 1.0 - (abs_yaw - self._YAW_FRONTAL)
+                         / (self._YAW_LIMIT - self._YAW_FRONTAL))
+
+        abs_pitch = abs(pitch_deg)
+        if abs_pitch <= self._PITCH_FRONTAL:
+            pitch_s = 1.0
+        else:
+            pitch_s = max(0.0, 1.0 - (abs_pitch - self._PITCH_FRONTAL)
+                           / (self._PITCH_LIMIT - self._PITCH_FRONTAL))
+
+        # Reconstruct composite with the refined components
+        composite = (
+            _WEIGHTS["face_size"]      * score.face_size
+            + _WEIGHTS["yaw"]          * yaw_s
+            + _WEIGHTS["pitch"]        * pitch_s
+            + _WEIGHTS["blur"]         * score.blur
+            + _WEIGHTS["illumination"] * score.illumination
+            + _WEIGHTS["occlusion"]    * score.occlusion
+        )
+
+        score.yaw = float(yaw_s)
+        score.pitch = float(pitch_s)
+        score.estimated_yaw_degrees = float(yaw_deg)
+        score.estimated_pitch_degrees = float(pitch_deg)
+        score.composite = float(np.clip(composite, 0.0, 1.0))
+        return score
+
     def _compute_occlusion_proxy(
         self, landmarks: np.ndarray, face_width: float
     ) -> float:

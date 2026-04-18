@@ -23,9 +23,28 @@ type Timetable = {
   timetable_id: string;
   name: string;
   description?: string;
+  timezone?: string;
   entries: TimetableEntry[];
   created_at: number;
 };
+
+// Common IANA zones — the input is also a free-text field so any valid zone works.
+const TIMEZONE_OPTIONS = [
+  "UTC",
+  "Asia/Kolkata",
+  "Asia/Tokyo",
+  "Asia/Singapore",
+  "Asia/Dubai",
+  "Asia/Shanghai",
+  "Asia/Seoul",
+  "Europe/London",
+  "Europe/Paris",
+  "Europe/Berlin",
+  "America/New_York",
+  "America/Chicago",
+  "America/Los_Angeles",
+  "Australia/Sydney",
+];
 
 type CameraRow = {
   camera_id: string;
@@ -57,7 +76,7 @@ export default function TimetablesPage() {
 
   const [showTTDialog,    setShowTTDialog]    = useState(false);
   const [editingTT,       setEditingTT]       = useState<Timetable | null>(null);
-  const [ttForm,          setTTForm]          = useState({ name: "", description: "" });
+  const [ttForm,          setTTForm]          = useState({ name: "", description: "", timezone: "Asia/Kolkata" });
 
   const [showEntryDialog, setShowEntryDialog] = useState(false);
   const [editingEntry,    setEditingEntry]    = useState<TimetableEntry | null>(null);
@@ -103,26 +122,36 @@ export default function TimetablesPage() {
 
   function openCreateTT() {
     setEditingTT(null);
-    setTTForm({ name: "", description: "" });
+    setTTForm({ name: "", description: "", timezone: "Asia/Kolkata" });
     setError("");
     setShowTTDialog(true);
   }
 
   function openEditTT(tt: Timetable) {
     setEditingTT(tt);
-    setTTForm({ name: tt.name, description: tt.description || "" });
+    setTTForm({
+      name: tt.name,
+      description: tt.description || "",
+      timezone: tt.timezone || "UTC",
+    });
     setError("");
     setShowTTDialog(true);
   }
 
   async function saveTT() {
     if (!ttForm.name.trim()) return;
+    const tz = (ttForm.timezone || "UTC").trim() || "UTC";
     setSaving(true); setError("");
     try {
       if (editingTT) {
-        await timetableApi.update(editingTT.timetable_id, ttForm);
+        await timetableApi.update(editingTT.timetable_id, { ...ttForm, timezone: tz });
       } else {
-        await timetableApi.create({ name: ttForm.name, description: ttForm.description, entries: [] });
+        await timetableApi.create({
+          name:        ttForm.name,
+          description: ttForm.description,
+          timezone:    tz,
+          entries:     [],
+        });
       }
       setShowTTDialog(false);
       await load();
@@ -403,6 +432,14 @@ export default function TimetablesPage() {
                       {tt.entries.length} {tt.entries.length === 1 ? "slot" : "slots"}
                     </span>
 
+                    {/* Timezone badge */}
+                    <span
+                      className="text-[10px] font-mono bg-zinc-800 text-blue-300 px-2 py-0.5 rounded-full border border-zinc-700 shrink-0"
+                      title="Timezone used for matching time slots"
+                    >
+                      {tt.timezone || "UTC"}
+                    </span>
+
                     {/* Camera assignment badges */}
                     {assignedCams.length > 0 && (
                       <div className="flex items-center gap-1.5 flex-wrap">
@@ -484,6 +521,25 @@ export default function TimetablesPage() {
                   onChange={e => setTTForm({ ...ttForm, description: e.target.value })}
                   placeholder="Optional"
                 />
+              </div>
+              <div>
+                <label className="text-xs text-zinc-400 block mb-1">
+                  Timezone <span className="text-red-400">*</span>
+                </label>
+                <input
+                  list="tt-timezone-options"
+                  className="w-full bg-zinc-800 border border-zinc-600 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500 font-mono"
+                  value={ttForm.timezone}
+                  onChange={e => setTTForm({ ...ttForm, timezone: e.target.value })}
+                  placeholder="e.g. Asia/Tokyo"
+                />
+                <datalist id="tt-timezone-options">
+                  {TIMEZONE_OPTIONS.map(z => <option key={z} value={z} />)}
+                </datalist>
+                <p className="text-[11px] text-zinc-500 mt-1">
+                  IANA zone (e.g. <span className="font-mono">Asia/Kolkata</span>,{" "}
+                  <span className="font-mono">Asia/Tokyo</span>). Slot start/end times are interpreted in this zone.
+                </p>
               </div>
             </div>
             {error && <p className="text-xs text-red-400">{error}</p>}

@@ -72,6 +72,9 @@ class TrackState(Enum):
     DELETED   = auto()   # Marked for removal
 
 
+_FEATURE_BANK_CAPACITY: int = 10   # StrongSORT-style ring buffer size
+
+
 @dataclass
 class Track:
     """Single tracked object with Kalman filter state."""
@@ -83,7 +86,14 @@ class Track:
     age:         int         # frames since track was created
     time_since_update: int   # frames since last matched detection
     conf:        float       # detection confidence at last update
-    reid_emb:    Optional[np.ndarray] = None   # last RE-ID embedding
+    reid_emb:    Optional[np.ndarray] = None   # most recent raw RE-ID embedding
+
+    # StrongSORT-style appearance memory.
+    #   smooth_emb: EMA of observed embeddings (primary cost vector).  L2-normalised.
+    #   feature_bank: short ring buffer of recent raw embeddings, used as a
+    #                 robust fallback when smooth_emb drifts (occlusion, fast motion).
+    smooth_emb:    Optional[np.ndarray] = None
+    feature_bank:  list[np.ndarray] = field(default_factory=list)
 
     # Kalman state [cx, cy, w, h, vx, vy, vw, vh]
     x:  np.ndarray = field(default_factory=lambda: np.zeros(8, dtype=np.float64))
@@ -116,6 +126,10 @@ class Track:
         # here would cap hit_streak at 1 regardless of consecutive hits, making
         # min_hits > 1 unreachable and preventing CONFIRMED promotion.
 
+    # StrongSORT EMA smoothing factor.  α=0.9 → slow drift, resilient to
+    # single-frame contamination (partial occlusion, motion blur).
+    _EMA_ALPHA: float = 0.9
+
     def update(self, bbox: np.ndarray, conf: float,
                reid_emb: Optional[np.ndarray] = None) -> None:
         """Kalman update step with matched detection."""
@@ -142,6 +156,19 @@ class Track:
 
         if reid_emb is not None:
             self.reid_emb = reid_emb
+            # StrongSORT EMA: blend new observation into smoothed feature,
+            # re-normalise so cosine distance stays well-defined.
+            if self.smooth_emb is None:
+                self.smooth_emb = reid_emb.astype(np.float32, copy=True)
+            else:
+                blended = self._EMA_ALPHA * self.smooth_emb \
+                        + (1.0 - self._EMA_ALPHA) * reid_emb
+                n = float(np.linalg.norm(blended)) + 1e-8
+                self.smooth_emb = (blended / n).astype(np.float32)
+            # Ring-buffer the raw embedding — bounded O(_FEATURE_BANK_CAPACITY)
+            self.feature_bank.append(reid_emb.astype(np.float32, copy=True))
+            if len(self.feature_bank) > _FEATURE_BANK_CAPACITY:
+                self.feature_bank.pop(0)
 
 
 # ── Global Motion Compensation ─────────────────────────────────────────────────
@@ -590,15 +617,34 @@ class BoTSORTTracker:
         iou_mat = _iou_batch(track_bboxes, det_bboxes)
         iou_cost = 1.0 - iou_mat  # lower is better
 
-        # Appearance cost (only if embeddings available and weight > 0)
+        # Appearance cost (only if embeddings available and weight > 0).
+        # StrongSORT: compare each detection to the track's EMA-smoothed
+        # embedding AND to every raw embedding in the track's feature bank;
+        # keep the minimum (i.e. best) cosine distance.  This recovers tracks
+        # through brief appearance drifts (pose change, partial occlusion)
+        # where the EMA alone would lag.
         reid_cost = None
         if w > 0.0:
-            track_embs = [t.reid_emb for t in tracks]
-            det_embs   = embeddings
-            if all(e is not None for e in track_embs) and all(e is not None for e in det_embs):
-                T_emb = np.stack(track_embs)           # [M, D]
+            det_embs = embeddings
+            track_primary = [
+                t.smooth_emb if t.smooth_emb is not None else t.reid_emb
+                for t in tracks
+            ]
+            if (all(e is not None for e in track_primary)
+                    and all(e is not None for e in det_embs)):
+                T_emb = np.stack(track_primary)        # [M, D]
                 D_emb = np.stack(det_embs)             # [N, D]
-                reid_cost = _cosine_distance(T_emb, D_emb) / 2.0  # normalise to [0,1]
+                reid_cost = _cosine_distance(T_emb, D_emb) / 2.0
+
+                # Fallback: for each track take the min cost across its bank
+                for i, tr in enumerate(tracks):
+                    bank = tr.feature_bank
+                    if not bank:
+                        continue
+                    bank_arr  = np.stack(bank)                 # [B, D]
+                    bank_cost = _cosine_distance(bank_arr, D_emb) / 2.0  # [B, N]
+                    best_row  = bank_cost.min(axis=0)          # [N]
+                    reid_cost[i] = np.minimum(reid_cost[i], best_row)
 
         cost = _fuse_cost(iou_cost, reid_cost, w)
 
@@ -639,6 +685,10 @@ class BoTSORTTracker:
             time_since_update=0,
             conf=conf,
             reid_emb=emb,
+            # Seed the EMA with the first observation so the first cost
+            # computation has something to compare against.
+            smooth_emb=emb.astype(np.float32, copy=True) if emb is not None else None,
+            feature_bank=[emb.astype(np.float32, copy=True)] if emb is not None else [],
             x=x,
             P=P,
         )

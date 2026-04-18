@@ -45,10 +45,13 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 
+from app.services.demographics import DemographicsEstimator
 from app.services.face_quality import FaceQualityAssessor, FaceQualityScore, QUALITY_RECOGNITION_THRESH
 from app.services.identity_state import IdentityTrackManager, TrackIdentityState
 from app.services.mot_tracker import BoTSORTConfig, BoTSORTTracker, Track
+from app.services.pose_estimator import PoseEstimator3D
 from app.services.reid_engine import REIDEngine, REIDGallery
+from app.services.temporal_liveness import TemporalLivenessTracker
 
 logger = logging.getLogger(__name__)
 
@@ -88,8 +91,15 @@ class FaceWithEmbedding:
     """Face detection enriched with embedding and liveness score."""
     face: FaceDetection
     embedding: np.ndarray   # [512] float32 L2-normalised
-    liveness: float         # 0.0 = spoof, 1.0 = live
+    liveness: float         # fused temporal liveness (preferred for decisions)
     face_chip: np.ndarray   # [112, 112, 3] uint8 BGR — aligned ArcFace crop
+    age: float = -1.0       # estimated age in years (-1 = unknown)
+    gender: int = -1        # 0=female, 1=male, -1=unknown
+    yaw: float = 0.0        # degrees, signed — from 1k3d68 when available
+    pitch: float = 0.0      # degrees, signed
+    roll: float = 0.0       # degrees, signed
+    liveness_single: float = 1.0   # raw single-frame MiniFASNet score
+    liveness_motion: float = 0.5   # micro-motion cue, 0=static/photo, 1=natural
 
 
 @dataclass
@@ -114,6 +124,10 @@ class TrackedPerson:
 
     # Linked FaceWithEmbedding (if face was detected and passed quality gate)
     fwe:                Any = None             # FaceWithEmbedding or None
+
+    # Demographics (from genderage.onnx; -1 = unknown)
+    age:                float = -1.0
+    gender:             int   = -1             # 0=female, 1=male, -1=unknown
 
 
 @dataclass
@@ -372,6 +386,9 @@ class AIPipeline:
         self._face_detector                              = None  # InsightFace SCRFD
         self._embed_sess:    ort.InferenceSession | None = None
         self._liveness_sess: ort.InferenceSession | None = None
+        self._demographics:  DemographicsEstimator | None = None
+        self._pose_estimator: PoseEstimator3D | None = None
+        self._temporal_liveness: TemporalLivenessTracker | None = None
 
         # Input/output name cache (filled on load)
         self._yolo_input:     str = "images"
@@ -401,7 +418,9 @@ class AIPipeline:
         self._load_face_detector()
         self._load_embedder()
         self._load_liveness()
-        self._load_sr_model()   # optional — skipped if model file absent
+        self._load_sr_model()      # optional — skipped if model file absent
+        self._load_demographics()  # optional — skipped if genderage.onnx absent
+        self._load_pose_estimator()  # optional — skipped if 1k3d68.onnx absent
         self._load_v2_components()
         self._loaded = True
 
@@ -419,6 +438,8 @@ class AIPipeline:
         det_sess = getattr(self._face_detector, "session", None) if self._face_detector else None
 
         reid_status = "LOADED ✓" if (self._reid_engine and self._reid_engine._session) else "disabled (no model)"
+        demog_status = "LOADED ✓" if (self._demographics and self._demographics.ready) else "disabled (no model)"
+        pose_status  = "LOADED ✓" if (self._pose_estimator and self._pose_estimator.ready) else "disabled (no model)"
 
         logger.info(
             "\n"
@@ -428,6 +449,8 @@ class AIPipeline:
             "  ║  ArcFace embedder     : %-34s ║\n"
             "  ║  MiniFASNet liveness  : %-34s ║\n"
             "  ║  OSNet RE-ID          : %-34s ║\n"
+            "  ║  GenderAge head       : %-34s ║\n"
+            "  ║  1k3d68 3D pose       : %-34s ║\n"
             "  ╚════════════════════════════════════════════════════════╝",
             self._device_id,
             _ep(self._yolo_sess),
@@ -435,6 +458,8 @@ class AIPipeline:
             _ep(self._embed_sess),
             _ep(self._liveness_sess),
             reid_status,
+            demog_status,
+            pose_status,
         )
 
     def _load_yolo(self) -> None:
@@ -470,6 +495,7 @@ class AIPipeline:
         self._reid_engine.load()
         self._reid_gallery     = REIDGallery(self._reid_engine)
         self._identity_manager = IdentityTrackManager()
+        self._temporal_liveness = TemporalLivenessTracker()
 
     def _load_face_detector(self) -> None:
         """
@@ -545,6 +571,28 @@ class AIPipeline:
             str(p), self._device_id, self._cache_dir, fp16=True
         )
         self._liveness_input = self._liveness_sess.get_inputs()[0].name
+
+    def _load_demographics(self) -> None:
+        """Optional age/gender head from buffalo_l/genderage.onnx."""
+        p = self._model_dir / "buffalo_l" / "genderage.onnx"
+        self._demographics = DemographicsEstimator(p)
+        self._demographics.load(
+            device_id=self._device_id,
+            cache_dir=self._cache_dir,
+            has_trt=_HAS_TRT,
+            has_cuda=_HAS_CUDA,
+        )
+
+    def _load_pose_estimator(self) -> None:
+        """Optional 3D pose head from buffalo_l/1k3d68.onnx."""
+        p = self._model_dir / "buffalo_l" / "1k3d68.onnx"
+        self._pose_estimator = PoseEstimator3D(p)
+        self._pose_estimator.load(
+            device_id=self._device_id,
+            cache_dir=self._cache_dir,
+            has_trt=_HAS_TRT,
+            has_cuda=_HAS_CUDA,
+        )
 
     # ── Person detection (YOLOv8l) ────────────────────────────────────────────
 
@@ -1175,19 +1223,55 @@ class AIPipeline:
             embeddings = self._embed_batch(chips_arr)
             breakdown["adaface_ms"] = (time.perf_counter() - t0) * 1000
 
-            # ── Stage 5: Liveness ─────────────────────────────────────────────
+            # ── Stage 4b: Demographics (age/gender) ───────────────────────────
+            t0 = time.perf_counter()
+            if self._demographics is not None and self._demographics.ready:
+                ages, genders = self._demographics.predict_batch(chips_arr)
+            else:
+                n = len(chips)
+                ages    = np.full((n,), -1.0, dtype=np.float32)
+                genders = np.full((n,), -1,   dtype=np.int8)
+            breakdown["demog_ms"] = (time.perf_counter() - t0) * 1000
+
+            # ── Stage 4c: 3D pose ────────────────────────────────────────────
+            t0 = time.perf_counter()
+            if self._pose_estimator is not None and self._pose_estimator.ready:
+                yaws, pitches, rolls = self._pose_estimator.estimate_batch(chips_arr)
+                # Refine quality scores with accurate 3D pose (replaces 5-pt heuristic)
+                if self._face_quality is not None:
+                    for i, q in enumerate(valid_quals):
+                        if isinstance(q, FaceQualityScore):
+                            self._face_quality.refine_with_3d_pose(
+                                q, float(yaws[i]), float(pitches[i]),
+                            )
+            else:
+                n = len(chips)
+                yaws    = np.zeros((n,), dtype=np.float32)
+                pitches = np.zeros((n,), dtype=np.float32)
+                rolls   = np.zeros((n,), dtype=np.float32)
+            breakdown["pose_ms"] = (time.perf_counter() - t0) * 1000
+
+            # ── Stage 5: Liveness (single-frame) ─────────────────────────────
             t0 = time.perf_counter()
             for i, (face, chip, emb) in enumerate(zip(valid_faces, chips, embeddings)):
                 liveness = 1.0 if skip_liveness else self.check_liveness(frame, face.bbox)
                 fwes.append(FaceWithEmbedding(
                     face=face,
                     embedding=emb,
-                    liveness=liveness,
+                    liveness=liveness,           # will be overwritten by temporal fusion
+                    liveness_single=liveness,
                     face_chip=chip,
+                    age=float(ages[i]),
+                    gender=int(genders[i]),
+                    yaw=float(yaws[i]),
+                    pitch=float(pitches[i]),
+                    roll=float(rolls[i]),
                 ))
             breakdown["liveness_ms"] = (time.perf_counter() - t0) * 1000
         else:
             breakdown["adaface_ms"]  = 0.0
+            breakdown["demog_ms"]    = 0.0
+            breakdown["pose_ms"]     = 0.0
             breakdown["liveness_ms"] = 0.0
 
         # ── Stage 6: MOT update + identity binding ────────────────────────────
@@ -1438,6 +1522,16 @@ class AIPipeline:
             if self._identity_manager is not None:
                 state = self._identity_manager.get(track.track_id)
 
+            # Temporal liveness fusion (per track), only when we have a face
+            # observation this frame — the tracker keeps per-track history so
+            # a real face hit by a single bad MiniFASNet score still passes.
+            if fwe is not None and self._temporal_liveness is not None:
+                tscore = self._temporal_liveness.update(
+                    track.track_id, fwe.liveness_single, fwe.face_chip,
+                )
+                fwe.liveness        = tscore.composite
+                fwe.liveness_motion = tscore.motion
+
             result.append(TrackedPerson(
                 track_id=track.track_id,
                 bbox=track.bbox,
@@ -1448,7 +1542,13 @@ class AIPipeline:
                 tracking_method=state.tracking_method if state else "motion",
                 face_quality=quality,
                 fwe=fwe,
+                age=fwe.age if fwe is not None else -1.0,
+                gender=fwe.gender if fwe is not None else -1,
             ))
+
+        # Periodic GC of stale temporal-liveness state
+        if self._temporal_liveness is not None:
+            self._temporal_liveness.gc()
 
         return result
 
